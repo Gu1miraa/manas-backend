@@ -17,15 +17,19 @@ from sentence_transformers import SentenceTransformer
 
 API_KEY    = "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"
 MODEL      = "llama-3.3-70b-versatile"
-CHUNK_SIZE = 500
-OVERLAP    = 50
-TOP_K      = 8
+CHUNK_SIZE = 800
+OVERLAP    = 100
+TOP_K      = 10
+MAX_TOKENS = 2000
 INDEX_FILE = "index.json"
 
 SYSTEM_PROMPT = """Ты — корпоративный ИИ-ассистент компании.
 Отвечай ТОЛЬКО на основе предоставленного контекста из документов компании.
 Если ответ не найден — честно скажи об этом.
-Не придумывай факты. Отвечай чётко и по делу.
+Не придумывай факты.
+Отвечай подробно и развёрнуто: раскрывай тему полностью, используй все релевантные детали
+из контекста (цифры, условия, исключения, шаги), структурируй ответ по пунктам или абзацам,
+если это уместно. Не сокращай ответ искусственно — краткость не приоритет, важна полнота.
 В конце ответа ОБЯЗАТЕЛЬНО укажи: "📄 Источник: [имя файла], страница [номер]"
 Отвечай на том же языке, на котором задан вопрос."""
 
@@ -198,6 +202,7 @@ def ask(query: str, reload: bool = False) -> tuple[str, list]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
         ],
+        max_tokens=MAX_TOKENS,
     )
     return response.choices[0].message.content, results
 
