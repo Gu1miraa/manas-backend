@@ -5,10 +5,22 @@ app.py — Streamlit-приложение + запуск Telegram-бота в ф
 Запуск:     streamlit run app.py
 """
 
+import threading
+
 import streamlit as st
 
 # Импортируем ядро
 from rag import add_document, add_pdf_pages, ask, clear_documents, get_all_sources, total_chunks
+from bot import run_bot
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЗАПУСК TELEGRAM-БОТА В ФОНОВОМ ПОТОКЕ
+# ──────────────────────────────────────────────────────────────────────────────
+
+if "bot_thread_started" not in st.session_state:
+    st.session_state.bot_thread_started = True
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  СТРАНИЦА
