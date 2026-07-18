@@ -1,8 +1,9 @@
 """
 rag.py — общее ядро: индексация, поиск, генерация ответа.
-Используется и Streamlit-приложением, и Telegram-ботом.
+Используется и Streamlit-приложением, и Telegram-ботом, и веб-API (api.py).
 """
-
+from dotenv import load_dotenv
+load_dotenv("key.env")
 import json
 import os
 import threading
@@ -15,7 +16,17 @@ from sentence_transformers import SentenceTransformer
 #  НАСТРОЙКИ
 # ──────────────────────────────────────────────────────────────────────────────
 
-API_KEY    = "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"
+# Ключ больше НЕ хранится в коде. Он берётся из переменной окружения GROQ_API_KEY.
+# Локально: создайте файл .env (см. .env.example) или экспортируйте переменную в терминале.
+# На Render/Railway: добавьте GROQ_API_KEY в разделе Environment Variables.
+API_KEY = os.environ.get("GROQ_API_KEY")
+if not API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY чөйрө өзгөрмөсү табылган жок. "
+        "Терминалда 'export GROQ_API_KEY=сиздин_ачкыч' деп коюңуз "
+        "же хостингдин Environment Variables бөлүмүнө кошуңуз."
+    )
+
 MODEL      = "llama-3.3-70b-versatile"
 CHUNK_SIZE = 800
 OVERLAP    = 100
