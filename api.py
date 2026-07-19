@@ -42,7 +42,7 @@ def chat():
         return jsonify({"error": "Суроо бош болбошу керек"}), 400
 
     try:
-        answer, sources = ask(question)
+        answer, sources = ask(question, lang=lang)
     except Exception as e:
         return jsonify({"error": f"Ички ката: {e}"}), 500
 

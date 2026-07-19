@@ -29,20 +29,36 @@ if not API_KEY:
 
 MODEL      = "llama-3.3-70b-versatile"
 CHUNK_SIZE = 800
-OVERLAP    = 100
-TOP_K      = 10
+OVERLAP    = 150
+TOP_K      = 14
 MAX_TOKENS = 2000
 INDEX_FILE = "index.json"
 
-SYSTEM_PROMPT = """Ты — корпоративный ИИ-ассистент компании.
+LANG_NAMES = {
+    "ky": "кыргызском",
+    "ru": "русском",
+    "tr": "турецком (Türkçe)",
+}
+
+def build_system_prompt(lang: str | None = None) -> str:
+    lang_instruction = ""
+    if lang and lang in LANG_NAMES:
+        lang_instruction = (
+            f"\nОБЯЗАТЕЛЬНО отвечай ТОЛЬКО на {LANG_NAMES[lang]} языке, "
+            f"даже если документы или контекст на другом языке. "
+            f"Не смешивай языки и не используй символы других алфавитов (например, китайские иероглифы) — это ошибка."
+        )
+    return f"""Ты — корпоративный ИИ-ассистент компании.
 Отвечай ТОЛЬКО на основе предоставленного контекста из документов компании.
-Если ответ не найден — честно скажи об этом.
+Прежде чем сказать, что ответ не найден, внимательно проверь ВЕСЬ предоставленный контекст —
+информация может быть сформулирована другими словами или синонимами, чем в вопросе.
+Если после этого ответ действительно не найден — честно скажи об этом.
 Не придумывай факты.
 Отвечай подробно и развёрнуто: раскрывай тему полностью, используй все релевантные детали
 из контекста (цифры, условия, исключения, шаги), структурируй ответ по пунктам или абзацам,
 если это уместно. Не сокращай ответ искусственно — краткость не приоритет, важна полнота.
 В конце ответа ОБЯЗАТЕЛЬНО укажи: "📄 Источник: [имя файла], страница [номер]"
-Отвечай на том же языке, на котором задан вопрос."""
+Отвечай на том же языке, на котором задан вопрос, если ниже не указано иное.{lang_instruction}"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  МОДЕЛИ
@@ -195,7 +211,7 @@ def search(query: str, top_k: int = TOP_K) -> list[dict]:
     return scored[:top_k]
 
 
-def ask(query: str, reload: bool = False) -> tuple[str, list]:
+def ask(query: str, reload: bool = False, lang: str | None = None) -> tuple[str, list]:
     if reload:
         reload_index()
 
@@ -210,7 +226,7 @@ def ask(query: str, reload: bool = False) -> tuple[str, list]:
     response = groq_client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(lang)},
             {"role": "user",   "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
         ],
         max_tokens=MAX_TOKENS,
