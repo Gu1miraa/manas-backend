@@ -2,8 +2,7 @@
 rag.py — общее ядро: индексация, поиск, генерация ответа.
 Используется и Streamlit-приложением, и Telegram-ботом, и веб-API (api.py).
 """
-from dotenv import load_dotenv
-load_dotenv("key.env")
+
 import json
 import os
 import threading
@@ -64,7 +63,7 @@ def build_system_prompt(lang: str | None = None) -> str:
 #  МОДЕЛИ
 # ──────────────────────────────────────────────────────────────────────────────
 
-embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+embed_model = SentenceTransformer("sentence-transformers/paraphrase-albert-small-v2")
 groq_client = Groq(api_key=API_KEY)
 
 _documents: list[dict] = []
