@@ -1,6 +1,9 @@
 """
 rag.py — общее ядро: индексация, поиск, генерация ответа.
 Используется и Streamlit-приложением, и Telegram-ботом, и веб-API (api.py).
+
+Эмбеддинги — через fastembed (ONNX, БЕЗ torch), чтобы уложиться
+в 512MB RAM бесплатного плана Render.
 """
 
 import json
@@ -8,15 +11,18 @@ import os
 import threading
 
 import numpy as np
+from dotenv import load_dotenv
+load_dotenv("key.env")
+
+from fastembed import TextEmbedding
 from groq import Groq
-from sentence_transformers import SentenceTransformer
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  НАСТРОЙКИ
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Ключ больше НЕ хранится в коде. Он берётся из переменной окружения GROQ_API_KEY.
-# Локально: создайте файл .env (см. .env.example) или экспортируйте переменную в терминале.
+# Локально: файл key.env (см. .env.example) — загружается через load_dotenv выше.
 # На Render/Railway: добавьте GROQ_API_KEY в разделе Environment Variables.
 API_KEY = os.environ.get("GROQ_API_KEY")
 if not API_KEY:
@@ -26,12 +32,13 @@ if not API_KEY:
         "же хостингдин Environment Variables бөлүмүнө кошуңуз."
     )
 
-MODEL      = "llama-3.3-70b-versatile"
-CHUNK_SIZE = 800
-OVERLAP    = 150
-TOP_K      = 14
-MAX_TOKENS = 2000
-INDEX_FILE = "index.json"
+MODEL       = "llama-3.3-70b-versatile"
+EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # ONNX через fastembed, torch керек эмес
+CHUNK_SIZE  = 800
+OVERLAP     = 150
+TOP_K       = 14
+MAX_TOKENS  = 2000
+INDEX_FILE  = "index.json"
 
 LANG_NAMES = {
     "ky": "кыргызском",
@@ -63,11 +70,22 @@ def build_system_prompt(lang: str | None = None) -> str:
 #  МОДЕЛИ
 # ──────────────────────────────────────────────────────────────────────────────
 
-embed_model = SentenceTransformer("sentence-transformers/paraphrase-albert-small-v2")
+embed_model = TextEmbedding(model_name=EMBED_MODEL)
 groq_client = Groq(api_key=API_KEY)
 
 _documents: list[dict] = []
 _lock = threading.Lock()
+
+
+def _encode_passages(texts: list[str]) -> list[np.ndarray]:
+    """Эмбеддинг документ бөлүкчөлөрү үчүн. e5 моделдер 'passage: ' префиксин талап кылат."""
+    prefixed = [f"passage: {t}" for t in texts]
+    return list(embed_model.embed(prefixed))
+
+
+def _encode_query(text: str) -> np.ndarray:
+    """Эмбеддинг издөө суроосу үчүн. e5 моделдер 'query: ' префиксин талап кылат."""
+    return list(embed_model.embed([f"query: {text}"]))[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  ДИСК
@@ -136,10 +154,10 @@ def _split_text(text: str) -> list[str]:
 def add_document(text: str, source: str = "unknown") -> int:
     """Индексирует обычный текст (TXT). Номер страницы = 0."""
     chunks = _split_text(text)
-    embeddings = embed_model.encode(chunks, normalize_embeddings=True)
+    embeddings = _encode_passages(chunks)
     with _lock:
         for chunk, emb in zip(chunks, embeddings):
-            _documents.append({"text": chunk, "emb": emb, "source": source, "page": 0})
+            _documents.append({"text": chunk, "emb": np.array(emb, dtype=np.float32), "source": source, "page": 0})
     save_index()
     return len(chunks)
 
@@ -153,9 +171,9 @@ def add_pdf_pages(pages: list[tuple[int, str]], source: str) -> int:
     all_chunks = []
     for page_num, page_text in pages:
         chunks = _split_text(page_text)
-        embeddings = embed_model.encode(chunks, normalize_embeddings=True)
+        embeddings = _encode_passages(chunks)
         for chunk, emb in zip(chunks, embeddings):
-            all_chunks.append({"text": chunk, "emb": emb, "source": source, "page": page_num})
+            all_chunks.append({"text": chunk, "emb": np.array(emb, dtype=np.float32), "source": source, "page": page_num})
         total += len(chunks)
     with _lock:
         _documents.extend(all_chunks)
@@ -193,7 +211,7 @@ def search(query: str, top_k: int = TOP_K) -> list[dict]:
         docs = list(_documents)
     if not docs:
         return []
-    q_emb = embed_model.encode([query], normalize_embeddings=True)[0]
+    q_emb = _encode_query(query)
     scored = sorted(
         [
             {
