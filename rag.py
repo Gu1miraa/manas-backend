@@ -1,9 +1,6 @@
 """
 rag.py — общее ядро: индексация, поиск, генерация ответа.
 Используется и Streamlit-приложением, и Telegram-ботом, и веб-API (api.py).
-
-Эмбеддинги — через fastembed (ONNX, БЕЗ torch), чтобы уложиться
-в 512MB RAM бесплатного плана Render.
 """
 
 import json
@@ -14,8 +11,8 @@ import numpy as np
 from dotenv import load_dotenv
 load_dotenv("key.env")
 
-from fastembed import TextEmbedding
 from groq import Groq
+from sentence_transformers import SentenceTransformer
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  НАСТРОЙКИ
@@ -23,17 +20,17 @@ from groq import Groq
 
 # Ключ больше НЕ хранится в коде. Он берётся из переменной окружения GROQ_API_KEY.
 # Локально: файл key.env (см. .env.example) — загружается через load_dotenv выше.
-# На Render/Railway: добавьте GROQ_API_KEY в разделе Environment Variables.
+# На хостинге (Hugging Face Spaces): добавьте GROQ_API_KEY в Settings → Secrets.
 API_KEY = os.environ.get("GROQ_API_KEY")
 if not API_KEY:
     raise RuntimeError(
         "GROQ_API_KEY чөйрө өзгөрмөсү табылган жок. "
         "Терминалда 'export GROQ_API_KEY=сиздин_ачкыч' деп коюңуз "
-        "же хостингдин Environment Variables бөлүмүнө кошуңуз."
+        "же хостингдин Environment Variables/Secrets бөлүмүнө кошуңуз."
     )
 
 MODEL       = "llama-3.3-70b-versatile"
-EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # ONNX через fastembed, torch керек эмес
+EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE  = 800
 OVERLAP     = 150
 TOP_K       = 14
@@ -51,41 +48,43 @@ def build_system_prompt(lang: str | None = None) -> str:
     if lang and lang in LANG_NAMES:
         lang_instruction = (
             f"\nОБЯЗАТЕЛЬНО отвечай ТОЛЬКО на {LANG_NAMES[lang]} языке, "
-            f"даже если документы или контекст на другом языке. "
-            f"Не смешивай языки и не используй символы других алфавитов (например, китайские иероглифы) — это ошибка."
+            f"даже если документы или контекст на другом языке."
         )
     return f"""Ты — корпоративный ИИ-ассистент компании.
 Отвечай ТОЛЬКО на основе предоставленного контекста из документов компании.
 Прежде чем сказать, что ответ не найден, внимательно проверь ВЕСЬ предоставленный контекст —
 информация может быть сформулирована другими словами или синонимами, чем в вопросе.
-Если после этого ответ действительно не найден — честно скажи об этом.
-Не придумывай факты.
+
+СТРОГО ЗАПРЕЩЕНО смешивать языки и алфавиты внутри одного ответа. Используй ТОЛЬКО буквы того
+языка, на котором пишешь ответ — никаких китайских, вьетнамских, арабских и других посторонних
+символов или слов, даже одного-двух. Если случайно вставляешь слово на другом языке — это ошибка,
+которую нужно избегать любой ценой. Перед отправкой ответа мысленно проверь каждое слово.
+
+КРИТИЧЕСКИ ВАЖНО: Если в контексте нет прямого ответа на вопрос — НЕ отвечай на основе общих
+знаний о том, как это "обычно бывает" в университетах или организациях. Это строго запрещено,
+даже если ты уверен в общем ответе. Вместо этого честно скажи, что в предоставленных документах
+такой информации не найдено, и предложи переформулировать вопрос или обратиться в соответствующий
+отдел университета напрямую. В этом случае НЕ указывай источник вообще — строка "Источник:"
+добавляется ТОЛЬКО когда ты даёшь содержательный ответ на основе найденной информации.
+Не придумывай факты, цифры, процедуры или названия должностей, которых нет в контексте.
+
 Отвечай подробно и развёрнуто: раскрывай тему полностью, используй все релевантные детали
 из контекста (цифры, условия, исключения, шаги), структурируй ответ по пунктам или абзацам,
 если это уместно. Не сокращай ответ искусственно — краткость не приоритет, важна полнота.
-В конце ответа ОБЯЗАТЕЛЬНО укажи: "📄 Источник: [имя файла], страница [номер]"
+
+Если ты даёшь содержательный ответ на основе контекста — ОБЯЗАТЕЛЬНО укажи в конце:
+"📄 Источник: [имя файла], страница [номер]".
 Отвечай на том же языке, на котором задан вопрос, если ниже не указано иное.{lang_instruction}"""
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  МОДЕЛИ
 # ──────────────────────────────────────────────────────────────────────────────
 
-embed_model = TextEmbedding(model_name=EMBED_MODEL)
+embed_model = SentenceTransformer(EMBED_MODEL)
 groq_client = Groq(api_key=API_KEY)
 
 _documents: list[dict] = []
 _lock = threading.Lock()
-
-
-def _encode_passages(texts: list[str]) -> list[np.ndarray]:
-    """Эмбеддинг документ бөлүкчөлөрү үчүн. e5 моделдер 'passage: ' префиксин талап кылат."""
-    prefixed = [f"passage: {t}" for t in texts]
-    return list(embed_model.embed(prefixed))
-
-
-def _encode_query(text: str) -> np.ndarray:
-    """Эмбеддинг издөө суроосу үчүн. e5 моделдер 'query: ' префиксин талап кылат."""
-    return list(embed_model.embed([f"query: {text}"]))[0]
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  ДИСК
@@ -154,10 +153,10 @@ def _split_text(text: str) -> list[str]:
 def add_document(text: str, source: str = "unknown") -> int:
     """Индексирует обычный текст (TXT). Номер страницы = 0."""
     chunks = _split_text(text)
-    embeddings = _encode_passages(chunks)
+    embeddings = embed_model.encode(chunks, normalize_embeddings=True)
     with _lock:
         for chunk, emb in zip(chunks, embeddings):
-            _documents.append({"text": chunk, "emb": np.array(emb, dtype=np.float32), "source": source, "page": 0})
+            _documents.append({"text": chunk, "emb": emb, "source": source, "page": 0})
     save_index()
     return len(chunks)
 
@@ -171,9 +170,9 @@ def add_pdf_pages(pages: list[tuple[int, str]], source: str) -> int:
     all_chunks = []
     for page_num, page_text in pages:
         chunks = _split_text(page_text)
-        embeddings = _encode_passages(chunks)
+        embeddings = embed_model.encode(chunks, normalize_embeddings=True)
         for chunk, emb in zip(chunks, embeddings):
-            all_chunks.append({"text": chunk, "emb": np.array(emb, dtype=np.float32), "source": source, "page": page_num})
+            all_chunks.append({"text": chunk, "emb": emb, "source": source, "page": page_num})
         total += len(chunks)
     with _lock:
         _documents.extend(all_chunks)
@@ -211,7 +210,7 @@ def search(query: str, top_k: int = TOP_K) -> list[dict]:
         docs = list(_documents)
     if not docs:
         return []
-    q_emb = _encode_query(query)
+    q_emb = embed_model.encode([query], normalize_embeddings=True)[0]
     scored = sorted(
         [
             {
@@ -247,6 +246,7 @@ def ask(query: str, reload: bool = False, lang: str | None = None) -> tuple[str,
             {"role": "user",   "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
         ],
         max_tokens=MAX_TOKENS,
+        temperature=0.3,
     )
     return response.choices[0].message.content, results
 
