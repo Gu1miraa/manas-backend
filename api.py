@@ -1,27 +1,12 @@
-"""
-api.py — жеңил веб-API. Manas AI React интерфейси ушул серверге суроо жиберет.
-
-Локалдуу иштетүү:
-    pip install flask flask-cors
-    export GROQ_API_KEY=сиздин_ачкыч          (Windows: set GROQ_API_KEY=...)
-    python api.py
-
-Production'до (Render/Railway):
-    gunicorn api:app   (Procfile ичинде)
-"""
-
 import os
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from rag import ask
+from rag import ask, total_chunks, get_all_sources   # <-- бул саптын аягына кошуу кереk
 
 app = Flask(__name__)
 
-# Кайсы сайттардан бул API'ге кайрылууга уруксат берилет.
-# Оболу '*' менен ачык коюп сынап көрүңүз, андан кийин так өз Vercel
-# доменинизге алмаштырыңыз (мисалы: "https://frontend-project-psi-green.vercel.app").
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 
@@ -31,18 +16,29 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/debug", methods=["GET"])          # <-- ЖАҢЫ ENDPOINT
+def debug():
+    return jsonify({
+        "total_chunks": total_chunks(),
+        "sources": get_all_sources(),
+    })
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json(force=True, silent=True) or {}
     question = (data.get("message") or "").strip()
-    # lang азырынча логго гана колдонулат — rag.py суроонун өз тилинде жооп берүүгө аракет кылат
     lang = data.get("lang", "ky")
+    history = data.get("history") or []
+    if not isinstance(history, list):
+        history = []
+    history = history[-10:]
 
     if not question:
         return jsonify({"error": "Суроо бош болбошу керек"}), 400
 
     try:
-        answer, sources = ask(question, lang=lang)
+        answer, sources = ask(question, lang=lang, history=history)
     except Exception as e:
         return jsonify({"error": f"Ички ката: {e}"}), 500
 

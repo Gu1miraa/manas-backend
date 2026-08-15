@@ -1,6 +1,9 @@
 """
 rag.py — общее ядро: индексация, поиск, генерация ответа.
 Используется и Streamlit-приложением, и Telegram-ботом, и веб-API (api.py).
+
+Генерация ответов полностью через Groq (Llama 3.3 70B) — быстрый, щедрая
+бесплатная квота (30 запросов/мин, ~1000+ запросов/день).
 """
 
 import json
@@ -18,22 +21,22 @@ from sentence_transformers import SentenceTransformer
 #  НАСТРОЙКИ
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Ключ больше НЕ хранится в коде. Он берётся из переменной окружения GROQ_API_KEY.
-# Локально: файл key.env (см. .env.example) — загружается через load_dotenv выше.
-# На хостинге (Hugging Face Spaces): добавьте GROQ_API_KEY в Settings → Secrets.
-API_KEY = os.environ.get("GROQ_API_KEY")
-if not API_KEY:
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
     raise RuntimeError(
         "GROQ_API_KEY чөйрө өзгөрмөсү табылган жок. "
-        "Терминалда 'export GROQ_API_KEY=сиздин_ачкыч' деп коюңуз "
+        "https://console.groq.com/keys дарегинен акысыз ачкыч алып, "
+        "'export GROQ_API_KEY=сиздин_ачкыч' деп коюңуз "
         "же хостингдин Environment Variables/Secrets бөлүмүнө кошуңуз."
     )
 
-MODEL       = "llama-3.3-70b-versatile"
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+GROQ_MODEL  = "llama-3.3-70b-versatile"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE  = 800
 OVERLAP     = 150
-TOP_K       = 14
+TOP_K       = 18
 MAX_TOKENS  = 2000
 INDEX_FILE  = "index.json"
 
@@ -52,28 +55,27 @@ def build_system_prompt(lang: str | None = None) -> str:
         )
     return f"""Ты — корпоративный ИИ-ассистент компании.
 Отвечай ТОЛЬКО на основе предоставленного контекста из документов компании.
-Прежде чем сказать, что ответ не найден, внимательно проверь ВЕСЬ предоставленный контекст —
-информация может быть сформулирована другими словами или синонимами, чем в вопросе.
+Внимательно изучи ВЕСЬ предоставленный контекст перед ответом — информация может быть
+сформулирована другими словами, сокращениями или синонимами, чем в вопросе. Если в контексте
+есть таблица, список или конкретные данные, относящиеся к теме вопроса — используй их, даже
+если формулировка в контексте не дословно совпадает с вопросом.
+
+Говори "информация не найдена" ТОЛЬКО если в контексте действительно нет данных, относящихся
+к теме вопроса — не будь излишне осторожным, если релевантная информация присутствует.
+Не отвечай на основе общих знаний о том, как это "обычно бывает" в университетах — только на
+основе того, что реально есть в контексте. Не придумывай факты, цифры или названия, которых
+нет в контексте.
 
 СТРОГО ЗАПРЕЩЕНО смешивать языки и алфавиты внутри одного ответа. Используй ТОЛЬКО буквы того
-языка, на котором пишешь ответ — никаких китайских, вьетнамских, арабских и других посторонних
-символов или слов, даже одного-двух. Если случайно вставляешь слово на другом языке — это ошибка,
-которую нужно избегать любой ценой. Перед отправкой ответа мысленно проверь каждое слово.
-
-КРИТИЧЕСКИ ВАЖНО: Если в контексте нет прямого ответа на вопрос — НЕ отвечай на основе общих
-знаний о том, как это "обычно бывает" в университетах или организациях. Это строго запрещено,
-даже если ты уверен в общем ответе. Вместо этого честно скажи, что в предоставленных документах
-такой информации не найдено, и предложи переформулировать вопрос или обратиться в соответствующий
-отдел университета напрямую. В этом случае НЕ указывай источник вообще — строка "Источник:"
-добавляется ТОЛЬКО когда ты даёшь содержательный ответ на основе найденной информации.
-Не придумывай факты, цифры, процедуры или названия должностей, которых нет в контексте.
+языка, на котором пишешь ответ.
 
 Отвечай подробно и развёрнуто: раскрывай тему полностью, используй все релевантные детали
 из контекста (цифры, условия, исключения, шаги), структурируй ответ по пунктам или абзацам,
 если это уместно. Не сокращай ответ искусственно — краткость не приоритет, важна полнота.
 
 Если ты даёшь содержательный ответ на основе контекста — ОБЯЗАТЕЛЬНО укажи в конце:
-"📄 Источник: [имя файла], страница [номер]".
+"📄 Источник: [имя файла], страница [номер]". Если честно говоришь, что информация не найдена —
+источник не указывай.
 Отвечай на том же языке, на котором задан вопрос, если ниже не указано иное.{lang_instruction}"""
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,7 +83,6 @@ def build_system_prompt(lang: str | None = None) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 embed_model = SentenceTransformer(EMBED_MODEL)
-groq_client = Groq(api_key=API_KEY)
 
 _documents: list[dict] = []
 _lock = threading.Lock()
@@ -204,6 +205,61 @@ def total_chunks() -> int:
 #  ПОИСК И ГЕНЕРАЦИЯ
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _prepare_search_query(query: str, history: list[dict] | None, lang: str | None) -> str:
+    """
+    Издөө үчүн суроону даярдайт: (1) маектин акыркы бөлүгүн эске алып, суроону
+    өз алдынча түшүнүктүү кылып кайра жазат, (2) документтер негизинен түркчө
+    болгондуктан, түркчөгө которот. Жоптун өзү дайыма колдонуучу тандаган тилде
+    кайтарылат — бул которуу жөн эле издөө үчүн гана.
+    """
+    if not query or not query.strip():
+        return query
+
+    history_text = ""
+    if history:
+        recent = history[-6:]
+        lines = []
+        for m in recent:
+            role = "Kullanıcı" if m.get("role") == "user" else "Asistan"
+            text = (m.get("text") or "").strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        history_text = "\n".join(lines)
+
+    if not history_text and lang == "tr":
+        return query
+
+    try:
+        prompt = (
+            "Aşağıda bir sohbet geçmişi (varsa) ve kullanıcının son sorusu var. "
+            "Son soruyu, sohbet geçmişindeki bağlamı da göz önünde bulundurarak, "
+            "tek başına anlaşılır, bağımsız bir arama sorgusuna dönüştür ve "
+            "TÜRKÇE olarak yaz. SADECE yeniden yazılmış soruyu döndür, başka hiçbir şey yazma.\n\n"
+        )
+        if history_text:
+            prompt += f"Sohbet geçmişi:\n{history_text}\n\n"
+        prompt += f"Son soru: {query}"
+
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0,
+        )
+        rewritten = (completion.choices[0].message.content or "").strip()
+
+        print(f"[DEBUG] groq rewrite raw='{rewritten}'")
+
+        if not rewritten or len(rewritten) < len(query) * 0.4:
+            print(f"[DEBUG] rewritten query өтө кыска/бош, түпнускага кайтабыз")
+            return query
+
+        return rewritten
+    except Exception as e:
+        print(f"[DEBUG] groq translate ERROR: {e}")
+        return query
+
+
 def search(query: str, top_k: int = TOP_K) -> list[dict]:
     """Возвращает список словарей: score, text, source, page."""
     with _lock:
@@ -227,11 +283,19 @@ def search(query: str, top_k: int = TOP_K) -> list[dict]:
     return scored[:top_k]
 
 
-def ask(query: str, reload: bool = False, lang: str | None = None) -> tuple[str, list]:
+def ask(query: str, reload: bool = False, lang: str | None = None, history: list[dict] | None = None) -> tuple[str, list]:
     if reload:
         reload_index()
 
-    results = search(query)
+    search_query = _prepare_search_query(query, history, lang)
+    print(f"[DEBUG] original='{query}' lang={lang} -> search_query='{search_query}'")
+
+    results = search(search_query)
+    print(f"[DEBUG] found {len(results)} results")
+    if results:
+        for r in results[:5]:
+            print(f"[DEBUG]   score={r['score']:.3f} source={r['source']} page={r['page']} text={r['text'][:80]!r}")
+
     if not results:
         return "Документы не загружены.", []
 
@@ -239,16 +303,36 @@ def ask(query: str, reload: bool = False, lang: str | None = None) -> tuple[str,
         [f"[{i+1}] (файл: {r['source']}, стр. {r['page']}) {r['text']}"
          for i, r in enumerate(results)]
     )
-    response = groq_client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": build_system_prompt(lang)},
-            {"role": "user",   "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
-        ],
-        max_tokens=MAX_TOKENS,
-        temperature=0.3,
-    )
-    return response.choices[0].message.content, results
+
+    history_note = ""
+    if history:
+        recent = history[-6:]
+        lines = []
+        for m in recent:
+            role = "Колдонуучу" if m.get("role") == "user" else "Жардамчы"
+            text = (m.get("text") or "").strip()
+            if text:
+                lines.append(f"{role}: {text}")
+        if lines:
+            history_note = "Мурунку маек (тактоо үчүн гана, жоопту документтен ал):\n" + "\n".join(lines) + "\n\n"
+
+    user_prompt = f"{history_note}Контекст:\n{context}\n\nВопрос: {query}"
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": build_system_prompt(lang)},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=MAX_TOKENS,
+            temperature=0,
+        )
+        answer = completion.choices[0].message.content
+        return answer, results
+    except Exception as e:
+        print(f"[DEBUG] Groq generate ERROR: {e}")
+        raise
 
 
 load_index()
