@@ -8,8 +8,10 @@ rag.py — общее ядро: индексация, поиск, генерац
 
 import json
 import os
+import re
 import threading
 
+import fitz  # PyMuPDF — нужен для автозагрузки PDF из docs/ при старте
 import numpy as np
 from dotenv import load_dotenv
 load_dotenv("key.env")
@@ -32,13 +34,14 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-GROQ_MODEL  = "llama-3.3-70b-versatile"
+GROQ_MODEL  = "openai/gpt-oss-120b"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE  = 800
 OVERLAP     = 150
 TOP_K       = 18
 MAX_TOKENS  = 2000
 INDEX_FILE  = "index.json"
+DOCS_DIR    = "docs"  # сюда кладём PDF, которые должны индексироваться сами при старте
 
 LANG_NAMES = {
     "ky": "кыргызском",
@@ -151,6 +154,17 @@ def _split_text(text: str) -> list[str]:
     return chunks
 
 
+# ── НОВОЕ: очистка колонтитулов (номер страницы + название регламента) ───────
+_FOOTER_RE = re.compile(
+    r"Sayfa:\s*\d+\s+[A-ZÇĞİÖŞÜÂÎÛ\s]+|^\s*KTMÜ MEVZUATI\s*$|^\s*\d+\s*$",
+    re.MULTILINE,
+)
+
+def _clean_page_text(text: str) -> str:
+    """Убирает повторяющиеся колонтитулы/номера страниц из текста страницы."""
+    return _FOOTER_RE.sub("", text)
+
+
 def add_document(text: str, source: str = "unknown") -> int:
     """Индексирует обычный текст (TXT). Номер страницы = 0."""
     chunks = _split_text(text)
@@ -164,19 +178,53 @@ def add_document(text: str, source: str = "unknown") -> int:
 
 def add_pdf_pages(pages: list[tuple[int, str]], source: str) -> int:
     """
-    Индексирует PDF постранично.
+    Индексирует PDF, склеивая текст ВСЕХ страниц в единый поток (после очистки
+    колонтитулов), чтобы статьи/абзацы, переходящие на следующую страницу, не
+    резались "вслепую" по границе страницы, а нарезались по смыслу (_split_text)
+    с overlap через границы страниц.
+    Номер страницы для каждого чанка вычисляется по его положению в общем тексте.
+
     pages = [(номер_страницы, текст_страницы), ...]
     """
-    total = 0
+    cleaned_pages = [(p_num, _clean_page_text(p_text)) for p_num, p_text in pages]
+
+    full_text = ""
+    page_offsets: list[tuple[int, int]] = []  # [(offset начала страницы, номер страницы), ...]
+    for p_num, p_text in cleaned_pages:
+        page_offsets.append((len(full_text), p_num))
+        full_text += p_text + "\n"
+
+    chunks = _split_text(full_text)
+
+    def _page_for_pos(pos: int) -> int:
+        page = page_offsets[0][1]
+        for offset, p_num in page_offsets:
+            if offset <= pos:
+                page = p_num
+            else:
+                break
+        return page
+
     all_chunks = []
-    for page_num, page_text in pages:
-        chunks = _split_text(page_text)
-        embeddings = embed_model.encode(chunks, normalize_embeddings=True)
-        for chunk, emb in zip(chunks, embeddings):
-            all_chunks.append({"text": chunk, "emb": emb, "source": source, "page": page_num})
-        total += len(chunks)
+    search_pos = 0
+    for chunk in chunks:
+        pos = full_text.find(chunk[:40], search_pos)
+        if pos == -1:
+            pos = search_pos
+        page_num = _page_for_pos(pos)
+        search_pos = pos + 1
+        all_chunks.append({"text": chunk, "source": source, "page_num": page_num})
+
+    embeddings = embed_model.encode(
+        [c["text"] for c in all_chunks], normalize_embeddings=True
+    )
+    total = len(all_chunks)
     with _lock:
-        _documents.extend(all_chunks)
+        for c, emb in zip(all_chunks, embeddings):
+            _documents.append({
+                "text": c["text"], "emb": emb,
+                "source": c["source"], "page": c["page_num"],
+            })
     save_index()
     return total
 
@@ -200,6 +248,32 @@ def get_all_sources() -> dict[str, int]:
 def total_chunks() -> int:
     with _lock:
         return len(_documents)
+
+
+# ── НОВОЕ: автозагрузка PDF из docs/ при старте, если индекс пуст ────────────
+def ensure_indexed() -> None:
+    """
+    Вызывается один раз при импорте модуля (см. самый низ файла).
+    Если индекс уже не пуст — ничего не делает.
+    Если пуст — сам читает все PDF из папки docs/ и индексирует их через
+    add_pdf_pages(), без необходимости вручную загружать файл через Streamlit.
+    """
+    if total_chunks() > 0:
+        print(f"Индекс уже загружен: {total_chunks()} фрагментов.")
+        return
+
+    if not os.path.isdir(DOCS_DIR):
+        print(f"Папка {DOCS_DIR} не найдена — нечего индексировать.")
+        return
+
+    for fname in os.listdir(DOCS_DIR):
+        if fname.lower().endswith(".pdf"):
+            path = os.path.join(DOCS_DIR, fname)
+            print(f"Автозагрузка: {fname} ...")
+            with fitz.open(path) as doc:
+                pages = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
+            n = add_pdf_pages(pages, fname)
+            print(f"  → {n} фрагментов добавлено.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  ПОИСК И ГЕНЕРАЦИЯ
@@ -336,3 +410,4 @@ def ask(query: str, reload: bool = False, lang: str | None = None, history: list
 
 
 load_index()
+ensure_indexed()

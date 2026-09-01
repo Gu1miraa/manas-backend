@@ -213,10 +213,14 @@ for msg in st.session_state.chat:
 
         if msg.get("sources"):
             with st.expander("📎 Источники из документов"):
-                for i, (score, text, source) in enumerate(msg["sources"], 1):
+                for i, src in enumerate(msg["sources"], 1):
+                    score = src["score"]
+                    text = src["text"]
+                    source = src["source"]
+                    page = src.get("page", 0)
                     st.markdown(f"""
                     <div class="doc-card">
-                        <h4>[{i}] {source} — релевантность: {score:.2f}</h4>
+                        <h4>[{i}] {source}, стр. {page} — релевантность: {score:.2f}</h4>
                         <p>{text[:300]}...</p>
                     </div>""", unsafe_allow_html=True)
 
