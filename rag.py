@@ -12,6 +12,7 @@ import re
 import threading
 
 import fitz  # PyMuPDF — нужен для автозагрузки PDF из docs/ при старте
+from docx import Document as DocxDocument  # python-docx — для .docx файлов
 import numpy as np
 from dotenv import load_dotenv
 load_dotenv("key.env")
@@ -79,6 +80,14 @@ def build_system_prompt(lang: str | None = None) -> str:
 Если ты даёшь содержательный ответ на основе контекста — ОБЯЗАТЕЛЬНО укажи в конце:
 "📄 Источник: [имя файла], страница [номер]". Если честно говоришь, что информация не найдена —
 источник не указывай.
+
+НИКОГДА не используй LaTeX-формулы. Это касается ЛЮБЫХ команд вида \\text{{}}, \\frac{{}}{{}}, \\sum,
+\\limits, \\displaystyle, \\times, \\cdot, а также квадратных скобок [ ... ] или круглых \\( ... \\)
+как обёртки для формул. Формулы пиши ОДНОЙ строкой обычными символами клавиатуры: ×, ÷, /, Σ,
+=, обычные скобки ( ). Пример правильного оформления формулы:
+Средний балл = Σ(оценка × кредит) / Σ(кредит)
+Пример НЕПРАВИЛЬНОГО оформления (так писать ЗАПРЕЩЕНО):
+[ \\text{{Средний балл}} = \\frac{{\\sum(\\text{{оценка}}_i \\times \\text{{кредит}}_i)}}{{\\sum \\text{{кредит}}_i}} ]
 Отвечай на том же языке, на котором задан вопрос, если ниже не указано иное.{lang_instruction}"""
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -154,7 +163,7 @@ def _split_text(text: str) -> list[str]:
     return chunks
 
 
-# ── НОВОЕ: очистка колонтитулов (номер страницы + название регламента) ───────
+# ── очистка колонтитулов (номер страницы + название регламента) ─────────────
 _FOOTER_RE = re.compile(
     r"Sayfa:\s*\d+\s+[A-ZÇĞİÖŞÜÂÎÛ\s]+|^\s*KTMÜ MEVZUATI\s*$|^\s*\d+\s*$",
     re.MULTILINE,
@@ -163,6 +172,67 @@ _FOOTER_RE = re.compile(
 def _clean_page_text(text: str) -> str:
     """Убирает повторяющиеся колонтитулы/номера страниц из текста страницы."""
     return _FOOTER_RE.sub("", text)
+
+
+# ── подстраховка — вычищаем LaTeX из ответа, если модель всё же
+#    использовала его, несмотря на инструкцию в системном промпте ────────────
+def _strip_latex(text: str) -> str:
+    """Заменяет типичные LaTeX-конструкции на обычный читаемый текст."""
+    if not text:
+        return text
+
+    # \frac{A}{B} -> (A)/(B) — по одному уровню вложенности, несколько проходов
+    frac_re = re.compile(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+    for _ in range(4):  # несколько проходов на случай вложенных \frac
+        new_text = frac_re.sub(r"(\1)/(\2)", text)
+        if new_text == text:
+            break
+        text = new_text
+
+    # \text{X} -> X
+    text = re.sub(r"\\text\s*\{([^{}]*)\}", r"\1", text)
+
+    # \sum с подстрочными/надстрочными индексами -> Σ
+    text = re.sub(r"\\sum(\\limits)?(_\{[^{}]*\})?(\^\{[^{}]*\})?", "Σ", text)
+    text = re.sub(r"\\sum(_\S+)?(\^\S+)?", "Σ", text)
+
+    # прочие частые команды
+    text = text.replace("\\displaystyle", "")
+    text = text.replace("\\limits", "")
+    text = text.replace("\\times", "×")
+    text = text.replace("\\cdot", "×")
+    text = text.replace("\\div", "÷")
+
+    # оставшиеся подстрочные/надстрочные индексы вида _{...} ^{...}
+    text = re.sub(r"[_^]\{([^{}]*)\}", r"\1", text)
+
+    # LaTeX-скобки-обёртки формул: \[ \] \( \)
+    text = text.replace("\\[", "").replace("\\]", "")
+    text = text.replace("\\(", "").replace("\\)", "")
+
+    # любые оставшиеся одиночные "\команда" без аргументов — просто убираем
+    # обратный слэш, оставляя слово (на случай редких команд вроде \alpha)
+    text = re.sub(r"\\([a-zA-Z]+)", r"\1", text)
+
+    # убираем случайно оставшиеся фигурные скобки
+    text = text.replace("{", "").replace("}", "")
+
+    # схлопываем лишние пробелы, которые могли появиться после замен
+    text = re.sub(r"[ \t]{2,}", " ", text)
+
+    return text
+
+
+def _extract_docx_text(path: str) -> str:
+    """Извлекает весь текст из .docx: обычные абзацы + текст из таблиц."""
+    doc = DocxDocument(path)
+    parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    parts.append(cell.text)
+    return "\n".join(parts)
 
 
 def add_document(text: str, source: str = "unknown") -> int:
@@ -250,7 +320,7 @@ def total_chunks() -> int:
         return len(_documents)
 
 
-# ── НОВОЕ: автозагрузка PDF из docs/ при старте, если индекс пуст ────────────
+# ── автозагрузка PDF из docs/ при старте, если индекс пуст ───────────────────
 def ensure_indexed() -> None:
     """
     Вызывается один раз при импорте модуля (см. самый низ файла).
@@ -267,13 +337,22 @@ def ensure_indexed() -> None:
         return
 
     for fname in os.listdir(DOCS_DIR):
-        if fname.lower().endswith(".pdf"):
-            path = os.path.join(DOCS_DIR, fname)
-            print(f"Автозагрузка: {fname} ...")
+        path = os.path.join(DOCS_DIR, fname)
+        lower = fname.lower()
+        if lower.endswith(".pdf"):
+            print(f"Автозагрузка (PDF): {fname} ...")
             with fitz.open(path) as doc:
                 pages = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
             n = add_pdf_pages(pages, fname)
             print(f"  → {n} фрагментов добавлено.")
+        elif lower.endswith(".docx"):
+            print(f"Автозагрузка (Word): {fname} ...")
+            try:
+                text = _extract_docx_text(path)
+                n = add_document(text, fname)
+                print(f"  → {n} фрагментов добавлено.")
+            except Exception as e:
+                print(f"  Ошибка чтения {fname}: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  ПОИСК И ГЕНЕРАЦИЯ
@@ -403,6 +482,7 @@ def ask(query: str, reload: bool = False, lang: str | None = None, history: list
             temperature=0,
         )
         answer = completion.choices[0].message.content
+        answer = _strip_latex(answer)
         return answer, results
     except Exception as e:
         print(f"[DEBUG] Groq generate ERROR: {e}")

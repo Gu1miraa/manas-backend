@@ -244,7 +244,11 @@ if send and query.strip():
 
     with st.spinner("Ищу ответ..."):
         try:
-            answer, sources = ask(user_input)
+            history = [
+                {"role": m["role"], "text": m["content"]}
+                for m in st.session_state.chat[:-1]
+            ]
+            answer, sources = ask(user_input, history=history)
             st.session_state.chat.append({
                 "role":    "assistant",
                 "content": answer,

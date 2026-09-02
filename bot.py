@@ -125,7 +125,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = text
     await update.message.reply_text("Ищу ответ...")
 
-    answer, results = ask(query, reload=True)
+    # Храним историю переписки для каждого пользователя отдельно (Telegram
+    # сам разделяет context.user_data по каждому собеседнику).
+    history = context.user_data.setdefault("history", [])
+
+    answer, results = ask(query, reload=True, history=list(history))
+
+    # Запоминаем этот обмен репликами, чтобы уточняющие вопросы вида
+    # "какие ТАМ формулы" понимались в контексте предыдущего вопроса.
+    history.append({"role": "user", "text": query})
+    history.append({"role": "assistant", "text": answer})
+    # Не даём истории расти бесконечно — оставляем последние 12 сообщений.
+    del history[:-12]
 
     sources_lines = []
     for r in results[:3]:
