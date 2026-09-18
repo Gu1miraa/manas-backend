@@ -39,8 +39,15 @@ GROQ_MODEL  = "openai/gpt-oss-120b"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_SIZE  = 800
 OVERLAP     = 150
-TOP_K       = 18
-MAX_TOKENS  = 2000
+# ВНИМАНИЕ: openai/gpt-oss-120b на Free-тарифе Groq имеет лимит всего 8,000
+# TPM (токенов в минуту, см. https://console.groq.com/docs/rate-limits).
+# TOP_K=18 чанков по ~750 символов + системный промпт + история + MAX_TOKENS
+# почти гарантированно превышали этот лимит на КАЖДОМ запросе (ошибка
+# rate_limit_exceeded / code 'tokens' -> 500 у клиента). Уменьшено, чтобы один
+# запрос надёжно укладывался в 8K TPM. Если апгрейднете тариф Groq — можно
+# вернуть прежние значения.
+TOP_K       = 6
+MAX_TOKENS  = 800
 INDEX_FILE  = "index.json"
 DOCS_DIR    = "docs"  # сюда кладём PDF, которые должны индексироваться сами при старте
 
@@ -413,27 +420,74 @@ def _prepare_search_query(query: str, history: list[dict] | None, lang: str | No
         return query
 
 
-def search(query: str, top_k: int = TOP_K) -> list[dict]:
-    """Возвращает список словарей: score, text, source, page."""
+def search(
+    query: str,
+    top_k: int = TOP_K,
+    extra_queries: list[str] | None = None,
+    min_per_source: int = 1,
+) -> list[dict]:
+    """Возвращает список словарей: score, text, source, page.
+
+    extra_queries — дополнительные варианты запроса (например, оригинал ДО
+    перевода на турецкий в _prepare_search_query). Для каждого чанка берётся
+    МАКСИМАЛЬНЫЙ score среди всех вариантов запроса — это устраняет перекос,
+    когда перевод запроса на один язык (турецкий) портит поиск по чанкам на
+    других языках (кыргызча/орусча).
+
+    min_per_source — гарантированный минимум чанков от КАЖДОГО источника в
+    результате (если у источника вообще есть релевантные чанки), чтобы один
+    большой документ (например mevzuat.pdf, ~84% всех чанков) не вытеснял
+    полностью остальные документы из top_k.
+    """
     with _lock:
         docs = list(_documents)
     if not docs:
         return []
-    q_emb = embed_model.encode([query], normalize_embeddings=True)[0]
-    scored = sorted(
-        [
-            {
-                "score":  float(np.dot(q_emb, d["emb"])),
-                "text":   d["text"],
-                "source": d["source"],
-                "page":   d.get("page", 0),
-            }
-            for d in docs
-        ],
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-    return scored[:top_k]
+
+    queries = [query] + [q for q in (extra_queries or []) if q]
+    seen = set()
+    uniq_queries = []
+    for q in queries:
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            uniq_queries.append(q)
+
+    q_embs = embed_model.encode(uniq_queries, normalize_embeddings=True)
+
+    scored = []
+    for d in docs:
+        best_score = max(float(np.dot(qe, d["emb"])) for qe in q_embs)
+        scored.append({
+            "score":  best_score,
+            "text":   d["text"],
+            "source": d["source"],
+            "page":   d.get("page", 0),
+        })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # 1-проход: гарантируем min_per_source лучших чанков от каждого источника
+    per_source_count: dict[str, int] = {}
+    final: list[dict] = []
+    for r in scored:
+        if len(final) >= top_k:
+            break
+        cnt = per_source_count.get(r["source"], 0)
+        if cnt < min_per_source:
+            final.append(r)
+            per_source_count[r["source"]] = cnt + 1
+
+    # 2-проход: остаток слотов добираем чисто по score (не важно из какого источника)
+    used_ids = {id(r) for r in final}
+    for r in scored:
+        if len(final) >= top_k:
+            break
+        if id(r) not in used_ids:
+            final.append(r)
+            used_ids.add(id(r))
+
+    final.sort(key=lambda x: x["score"], reverse=True)
+    return final[:top_k]
 
 
 def ask(query: str, reload: bool = False, lang: str | None = None, history: list[dict] | None = None) -> tuple[str, list]:
@@ -443,7 +497,11 @@ def ask(query: str, reload: bool = False, lang: str | None = None, history: list
     search_query = _prepare_search_query(query, history, lang)
     print(f"[DEBUG] original='{query}' lang={lang} -> search_query='{search_query}'")
 
-    results = search(search_query)
+    # Передаём и переведённый (обычно турецкий), и оригинальный запрос — для
+    # каждого чанка берётся максимальный score среди вариантов, чтобы документы
+    # не на турецком языке не проигрывали чанкам mevzuat.pdf только из-за перевода.
+    extra = [query] if search_query != query else None
+    results = search(search_query, extra_queries=extra)
     print(f"[DEBUG] found {len(results)} results")
     if results:
         for r in results[:5]:
